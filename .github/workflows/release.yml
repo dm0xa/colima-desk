@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          key: ${{ matrix.target }}
+
+      - name: install frontend dependencies
+        run: npm ci
+
+      - name: build the app
+        run: npm run tauri build -- --target ${{ matrix.target }} --bundles app
+
+      # The disk image is assembled by dmg/build.sh: it lays the Finder window
+      # out itself and fails the run when the stored positions are not the ones
+      # the background was drawn for.
+      - name: build the disk image
+        id: dmg
+        run: |
+          set -eu
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          dmg="src-tauri/target/${{ matrix.target }}/release/bundle/dmg/Colima Desk_${version}_${{ matrix.arch }}.dmg"
+          src-tauri/dmg/build.sh \
+            "src-tauri/target/${{ matrix.target }}/release/bundle/macos/Colima Desk.app" \
+            "$dmg"
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${{ github.ref_name }}"
+          dmg="${{ steps.dmg.outputs.path }}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --title "Colima Desk $tag" \
+              --notes "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." || true
+          fi
+          gh release upload "$tag" "$dmg" --clobber
