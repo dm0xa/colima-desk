@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn colima_bin() -> String {
@@ -32,6 +33,54 @@ fn humanize(raw: &str) -> String {
         }
     }
     raw.to_string()
+}
+
+fn home_dir() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) if !home.trim().is_empty() => PathBuf::from(home),
+        _ => PathBuf::from("/tmp"),
+    }
+}
+
+/// The Colima config home. Reading profile configs, the template and a stopped profile's
+/// socket means landing on the same directory the CLI itself uses — see
+/// [`resolve_colima_home`] for the order and why it is not guessed.
+pub fn colima_home() -> PathBuf {
+    let env = |key: &str| std::env::var(key).ok();
+    resolve_colima_home(
+        env("COLIMA_HOME").as_deref(),
+        &home_dir().to_string_lossy(),
+        env("XDG_CONFIG_HOME").as_deref(),
+    )
+}
+
+/// Pure form of [`colima_home`], so the precedence is testable without mutating the
+/// process environment (tests run in parallel threads).
+///
+/// Measured against colima 0.10.3: `$COLIMA_HOME` when that directory exists, then
+/// `~/.colima` when it exists (the CLI prints `found ~/.colima, ignoring
+/// $XDG_CONFIG_HOME`), then `$XDG_CONFIG_HOME/colima` when the variable is set and
+/// non-empty, else `~/.colima`. `~/.config/colima` alone never counts, because the
+/// variable has to name it.
+///
+/// Existence alone decides. A directory holding no state still wins in the CLI, so a
+/// "does it look populated" test here would disagree with the command we shell out to.
+pub fn resolve_colima_home(colima_home: Option<&str>, home: &str, xdg: Option<&str>) -> PathBuf {
+    if let Some(dir) = colima_home.map(str::trim).filter(|d| !d.is_empty()) {
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return path;
+        }
+    }
+    let home = if home.trim().is_empty() { "/tmp" } else { home };
+    let legacy = PathBuf::from(home).join(".colima");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    match xdg.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg).join("colima"),
+        None => legacy,
+    }
 }
 
 pub fn run(args: &[&str]) -> Result<String, String> {
@@ -68,12 +117,14 @@ fn instance_name(profile: &str) -> &str {
 /// The profile's disk image on the host: path plus the bytes it actually occupies.
 /// The image is sparse, so `len()` overstates it; allocated blocks are what Finder charges.
 pub fn disk_image(profile: &str) -> (String, u64) {
-    let home = std::env::var("HOME").unwrap_or_default();
     let instance = instance_name(profile);
-    let candidates = [
-        format!("{home}/.colima/_lima/{instance}/disk"),
-        format!("{home}/.lima/{instance}/disk"),
-    ];
+    // Colima runs limactl with LIMA_HOME pointing at `<colima_home>/_lima`, so that leg
+    // comes first; the other two cover a lima relocation and a hand-run VM.
+    let mut candidates = vec![colima_home().join("_lima").join(instance).join("disk")];
+    if let Some(lima) = std::env::var("LIMA_HOME").ok().map(|d| d.trim().to_string()).filter(|d| !d.is_empty()) {
+        candidates.push(PathBuf::from(lima).join(instance).join("disk"));
+    }
+    candidates.push(home_dir().join(".lima").join(instance).join("disk"));
     for path in candidates {
         let Ok(meta) = std::fs::metadata(&path) else { continue };
         #[cfg(unix)]
@@ -84,7 +135,7 @@ pub fn disk_image(profile: &str) -> (String, u64) {
         #[cfg(not(unix))]
         let bytes = meta.len();
         if bytes > 0 {
-            return (path, bytes);
+            return (path.display().to_string(), bytes);
         }
     }
     (String::new(), 0)
@@ -169,14 +220,12 @@ pub fn docker_endpoint(profile: &str, status: Option<&Status>) -> String {
             return socket;
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
     let dir = if profile == "default" { "default".to_string() } else { profile.to_string() };
-    format!("unix://{home}/.colima/{dir}/docker.sock")
+    format!("unix://{}/{dir}/docker.sock", colima_home().display())
 }
 
 pub fn template() -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{home}/.colima/_templates/default.yaml");
+    let path = colima_home().join("_templates").join("default.yaml");
     std::fs::read_to_string(&path).map_err(|e| format!("read template: {e}"))
 }
 
@@ -198,8 +247,13 @@ pub struct ProfileConfig {
 }
 
 pub fn profile_config(profile: &str) -> Result<ProfileConfig, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{home}/.colima/{profile}/colima.yaml");
+    profile_config_in(&colima_home(), profile)
+}
+
+/// The config of one profile under a given Colima home. Split from [`profile_config`]
+/// so a test can read a temp directory instead of the user's real one.
+fn profile_config_in(home: &Path, profile: &str) -> Result<ProfileConfig, String> {
+    let path = home.join(profile).join("colima.yaml");
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read config: {e}"))?;
     let mut cfg = ProfileConfig { vm_type: "vz".into(), runtime: "docker".into(), arch: "aarch64".into(), mount_type: "virtiofs".into(), cpu: 2, memory: 2, disk: 60, rosetta: false };
     for line in text.lines() {
@@ -751,6 +805,7 @@ pub fn nerdctl_install(profile: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{humanize, rosetta_applies};
+    use std::path::Path;
 
     #[test]
     fn instance_name_follows_the_colima_default() {
@@ -873,5 +928,145 @@ f\t0\t2026-11-11T19:04:00.0000000000\troot\troot\t600\t\tbad name\0";
         // A truncated or foreign line must never become an entry with an empty name.
         assert!(super::parse_volume_entries("f\t1\t2026-11-11T00:00:00Z\troot\0").is_empty());
         assert!(super::parse_volume_entries("\0\0").is_empty());
+    }
+
+    /// A scratch directory that removes itself; no test may touch the real `$HOME`.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("colima-desk-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn dir(&self, rel: &str) -> std::path::PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // --- Colima config home (see resolve_colima_home) ---
+
+    #[test]
+    fn colima_home_env_wins_when_the_directory_exists() {
+        let scratch = Scratch::new("home-env");
+        let env_dir = scratch.dir("relocated");
+        scratch.dir(".colima");
+        let xdg = scratch.dir("xdg");
+        assert_eq!(
+            super::resolve_colima_home(
+                Some(env_dir.to_str().unwrap()),
+                scratch.path().to_str().unwrap(),
+                Some(xdg.to_str().unwrap()),
+            ),
+            env_dir
+        );
+    }
+
+    #[test]
+    fn colima_home_env_is_ignored_when_the_directory_is_absent() {
+        // Colima only honours $COLIMA_HOME for a directory that exists; a stale export
+        // must not poison the resolution.
+        let scratch = Scratch::new("home-env-missing");
+        let legacy = scratch.dir(".colima");
+        let bogus = scratch.path().join("no-such-dir");
+        assert_eq!(
+            super::resolve_colima_home(
+                Some(bogus.to_str().unwrap()),
+                scratch.path().to_str().unwrap(),
+                None,
+            ),
+            legacy
+        );
+    }
+
+    #[test]
+    fn legacy_home_beats_xdg_because_the_cli_ignores_xdg_then() {
+        let scratch = Scratch::new("home-legacy");
+        let legacy = scratch.dir(".colima");
+        let xdg = scratch.dir("xdg");
+        assert_eq!(
+            super::resolve_colima_home(None, scratch.path().to_str().unwrap(), Some(xdg.to_str().unwrap())),
+            legacy
+        );
+    }
+
+    #[test]
+    fn xdg_home_is_used_when_no_legacy_directory_exists() {
+        let scratch = Scratch::new("home-xdg");
+        let xdg = scratch.dir("xdg");
+        assert_eq!(
+            super::resolve_colima_home(None, scratch.path().to_str().unwrap(), Some(xdg.to_str().unwrap())),
+            xdg.join("colima")
+        );
+    }
+
+    #[test]
+    fn blank_xdg_home_falls_back_to_legacy() {
+        let scratch = Scratch::new("home-xdg-blank");
+        let legacy = scratch.path().join(".colima");
+        assert_eq!(
+            super::resolve_colima_home(None, scratch.path().to_str().unwrap(), Some("   ")),
+            legacy
+        );
+    }
+
+    #[test]
+    fn dot_config_colima_is_not_picked_up_without_the_variable() {
+        // An unset XDG_CONFIG_HOME never means `~/.config`; colima keeps using `~/.colima`.
+        let scratch = Scratch::new("home-dot-config");
+        scratch.dir(".config/colima");
+        assert_eq!(
+            super::resolve_colima_home(None, scratch.path().to_str().unwrap(), None),
+            scratch.path().join(".colima")
+        );
+    }
+
+    #[test]
+    fn an_empty_home_still_yields_an_absolute_path() {
+        assert_eq!(super::resolve_colima_home(None, "", None), std::path::Path::new("/tmp/.colima"));
+    }
+
+    #[test]
+    fn reads_a_profile_config_from_an_xdg_layout_home() {
+        let scratch = Scratch::new("profile-xdg");
+        let xdg = scratch.dir("xdg");
+        let profile = xdg.join("colima").join("default");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(
+            profile.join("colima.yaml"),
+            "vmType: qemu\nruntime: containerd\narch: x86_64\nmountType: 9p\ncpu: 8\nmemory: 16\ndisk: 120\nrosetta: true\n",
+        )
+        .unwrap();
+        let home = super::resolve_colima_home(None, scratch.path().to_str().unwrap(), Some(xdg.to_str().unwrap()));
+        let cfg = super::profile_config_in(&home, "default").unwrap();
+        assert_eq!(cfg.vm_type, "qemu");
+        assert_eq!(cfg.runtime, "containerd");
+        assert_eq!(cfg.arch, "x86_64");
+        assert_eq!(cfg.mount_type, "9p");
+        assert_eq!((cfg.cpu, cfg.memory, cfg.disk), (8, 16, 120));
+        assert!(cfg.rosetta);
+    }
+
+    #[test]
+    fn a_missing_profile_config_names_the_file_it_could_not_read() {
+        let scratch = Scratch::new("profile-missing");
+        match super::profile_config_in(scratch.path(), "work") {
+            Ok(_) => panic!("a config that does not exist must not parse"),
+            Err(err) => assert!(err.starts_with("read config: "), "{err}"),
+        }
     }
 }

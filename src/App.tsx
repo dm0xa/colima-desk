@@ -2565,7 +2565,7 @@ function App() {
                     </div>
                     {template && <pre className="logs code-block" style={{ marginTop: 12 }}>{template}</pre>}
                     {sshConfig && <pre className="logs code-block" style={{ marginTop: 12 }}>{sshConfig}</pre>}
-                    <p className="settings-note">Template lives at <code>.colima/_templates/default.yaml</code>.</p>
+                    <p className="settings-note">Template lives at <code>_templates/default.yaml</code> inside the Colima config home (<code>~/.colima</code> or <code>$XDG_CONFIG_HOME/colima</code>).</p>
                   </section>
                 )}
 

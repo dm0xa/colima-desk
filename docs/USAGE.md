@@ -362,7 +362,7 @@ The **Also detected** list under the rows names the tools that are not tied to a
 
 ### Configuration
 
-- **Show template** reads `~/.colima/_templates/default.yaml`.
+- **Show template** reads `_templates/default.yaml` inside the Colima config home (`$COLIMA_HOME`, otherwise `~/.colima`, otherwise `$XDG_CONFIG_HOME/colima`).
 - **Show SSH config** runs `colima ssh-config` for the selected profile.
 
 Both are read-only views with a hide button.

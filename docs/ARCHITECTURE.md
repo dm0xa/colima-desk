@@ -68,8 +68,9 @@ A thin wrapper around the `colima` binary.
 - `status()` takes the first line that starts with `{`, because Colima can print log lines before the JSON object.
 - `start()` maps typed options to `colima start` flags. The CPU value is a count; memory and disk are GiB. `list --json` reports bytes.
 - `delete()` adds `--data` only when the caller asks for it. The sidebar delete keeps data; Settings → Delete profile removes it.
-- `docker_endpoint(profile, status)` falls back to `~/.colima/<profile>/docker.sock` when the profile is stopped, so commands fail against the right socket instead of another profile's daemon. It takes the status the caller already fetched: `colima status` costs about 700 ms and must not run twice in one profile switch.
-- `profile_config()` reads `~/.colima/<profile>/colima.yaml` with a key/value scan. It is not a full YAML parser; it handles the top-level fields the UI needs.
+- `colima_home()` / `resolve_colima_home()` find the Colima config home the way the CLI does: `$COLIMA_HOME` when that directory exists, then `~/.colima` when it exists, then `$XDG_CONFIG_HOME/colima` when the variable is set, else `~/.colima`. The resolver is pure so its precedence is tested without mutating process env, and existence alone decides — Colima keeps a directory that holds no state.
+- `docker_endpoint(profile, status)` falls back to `<config home>/<profile>/docker.sock` when the profile is stopped, so commands fail against the right socket instead of another profile's daemon. It takes the status the caller already fetched: `colima status` costs about 700 ms and must not run twice in one profile switch.
+- `profile_config()` reads `<config home>/<profile>/colima.yaml` with a key/value scan. It is not a full YAML parser; it handles the top-level fields the UI needs.
 - `template()` reads the template file directly; `ssh_config()` shells out to `colima ssh-config`.
 - Model server commands spawn `colima model serve` detached and return the PID. Stopping sends `SIGTERM` to that PID.
 
@@ -105,7 +106,7 @@ The Cleanup page asks where the storage went, so it reads two sources that answe
 
 - `system df -v --format {{json .}}` for the container accounting: per-image use counts and ages, per-volume link counts, stopped container writable layers, and build cache entries. Rows are deduplicated by image ID, because one image with two tags would otherwise be counted and removed twice. The command goes through `run_client()` — Colima's nerdctl wrapper on containerd profiles, the Docker CLI on the Docker runtime, and the Docker CLI as one fallback attempt when the wrapper cannot run the verbose format. nerdctl's rows use their own keys (`CreatedSince`, `CacheType`, `LastUsedSince`) and omit container `State`, so ages fall back to the human phrase and running state comes from the `Up` prefix in `Status`.
 - `colima ssh -- sh -c` for what actually occupies the VM: `du` of `/var/lib/docker`, the guest root filesystem, and the largest `*-json.log` files, which Docker's totals do not include. `du` needs `sudo`; when the guest refuses it the Docker numbers still render.
-- `std::fs::metadata` on the profile's sparse disk image (`~/.colima/_lima/<instance>/disk`) for the bytes it occupies on the host. `metadata.blocks() * 512` is the allocated size, not the apparent size a 60 GiB disk reports.
+- `std::fs::metadata` on the profile's sparse disk image (`<config home>/_lima/<instance>/disk`, then `$LIMA_HOME`, then `~/.lima`) for the bytes it occupies on the host. `metadata.blocks() * 512` is the allocated size, not the apparent size a 60 GiB disk reports.
 
 The three calls run on separate threads inside `report()`, so the page waits for the slowest one instead of their sum. Image "unique" bytes come from Docker's `UniqueSize`; summing them is the honest saving, since shared base layers survive while another image uses them.
 
