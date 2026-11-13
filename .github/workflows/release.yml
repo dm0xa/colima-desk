@@ -1,5 +1,10 @@
 name: Release
 
+# Release assets are attached when the release is created, never afterwards:
+# the repository has immutable releases enabled, and an upload to an existing
+# release fails with `HTTP 422: Cannot upload assets to an immutable release`.
+# That is why the two matrix builds only upload workflow artifacts and a single
+# job creates the release with both disk images in one call.
 on:
   push:
     tags:
@@ -58,16 +63,37 @@ jobs:
             "$dmg"
           echo "path=$dmg" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dmg-*
+          merge-multiple: true
+          path: dmg
+
       - name: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           tag="${{ github.ref_name }}"
-          dmg="${{ steps.dmg.outputs.path }}"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --title "Colima Desk $tag" \
-              --notes "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." || true
+          ls -l dmg
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists, and an immutable release cannot accept assets afterwards — delete the release and push the tag again"
+            exit 1
           fi
-          gh release upload "$tag" "$dmg" --clobber
+          gh release create "$tag" \
+            --verify-tag \
+            --title "Colima Desk $tag" \
+            --notes "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)." \
+            dmg/*
