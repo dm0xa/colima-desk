@@ -1,6 +1,6 @@
 [package]
 name = "colima-gui"
-version = "1.0.1"
+version = "1.0.2"
 description = "Colima Desk — macOS GUI for Colima"
 authors = ["Colima Desk contributors"]
 edition = "2024"

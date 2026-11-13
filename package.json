@@ -1,7 +1,7 @@
 {
   "name": "colima-desk",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "macOS desktop app for Colima",
   "author": "dm0xa",
   "license": "MIT",
