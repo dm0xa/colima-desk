@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 fn colima_bin() -> String {
     crate::tools::which_bin("colima")
@@ -157,7 +159,46 @@ pub struct Profile {
     pub runtime: Option<String>,
 }
 
+/// `colima list --json` answers one question for the whole window, and the launch asks it
+/// twice: the first read of the window, then the first refresh. The gate makes the second
+/// caller wait for the run already in flight instead of spawning the CLI again; the short
+/// TTL keeps it honest for everyone else (the 15 s refresh still reads the CLI).
+static LIST_GATE: Mutex<()> = Mutex::new(());
+static LIST_CACHE: RwLock<Option<(Instant, Vec<Profile>)>> = RwLock::new(None);
+/// Longer than a CLI run, far shorter than a refresh cycle, so a profile started or
+/// stopped by another window cannot hide behind it.
+const LIST_TTL: Duration = Duration::from_secs(3);
+
 pub fn list_profiles() -> Result<Vec<Profile>, String> {
+    let _gate = LIST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(slot) = LIST_CACHE.read() {
+        if let Some((at, cached)) = slot.as_ref() {
+            if at.elapsed() < LIST_TTL {
+                return Ok(cached.clone());
+            }
+        }
+    }
+    let out = read_profiles()?;
+    if let Ok(mut slot) = LIST_CACHE.write() {
+        *slot = Some((Instant::now(), out.clone()));
+    }
+    Ok(out)
+}
+
+/// Drops the cached list: the set of profiles or one profile's state just changed.
+pub fn invalidate_profiles() {
+    if let Ok(mut slot) = LIST_CACHE.write() {
+        *slot = None;
+    }
+}
+
+/// Runs `colima list` while the window is still loading its bundle, so the first read the
+/// view makes is already answered.
+pub fn prefetch_profiles() {
+    let _ = list_profiles();
+}
+
+fn read_profiles() -> Result<Vec<Profile>, String> {
     let raw = run(&["list", "--json"])?;
     let mut out = Vec::new();
     for line in raw.lines() {
@@ -349,6 +390,14 @@ pub fn rosetta_applies(vm_type: Option<&str>) -> bool {
     matches!(vm_type, None | Some("vz"))
 }
 
+/// A command that starts, stops, restarts or removes a profile: the list the window reads
+/// next is different, so the cached read must not outlive it.
+fn run_mutation(args: &[&str]) -> Result<String, String> {
+    let out = run(args);
+    invalidate_profiles();
+    out
+}
+
 pub fn start(o: &StartOpts) -> Result<String, String> {
     let mut a: Vec<String> = vec!["start".into()];
     if o.profile != "default" { a.push(o.profile.clone()); }
@@ -363,17 +412,17 @@ pub fn start(o: &StartOpts) -> Result<String, String> {
     if let Some(v) = &o.mount { if !v.trim().is_empty() { a.push("--mount".into()); a.push(v.clone()); } }
     if let Some(v) = &o.hostname { if !v.trim().is_empty() { a.push("--hostname".into()); a.push(v.clone()); } }
     let r: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
-    run(&r)
+    run_mutation(&r)
 }
 
 pub fn stop(profile: &str) -> Result<String, String> {
     let a: Vec<&str> = if profile == "default" { vec!["stop"] } else { vec!["stop", profile] };
-    run(&a)
+    run_mutation(&a)
 }
 
 pub fn restart(profile: &str) -> Result<String, String> {
     let a: Vec<&str> = if profile == "default" { vec!["restart"] } else { vec!["restart", profile] };
-    run(&a)
+    run_mutation(&a)
 }
 
 pub fn delete(profile: &str, data: bool, force: bool) -> Result<String, String> {
@@ -382,7 +431,7 @@ pub fn delete(profile: &str, data: bool, force: bool) -> Result<String, String> 
     if data { a.push("--data".into()); }
     if force { a.push("--force".into()); }
     let r: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
-    run(&r)
+    run_mutation(&r)
 }
 
 pub fn kubernetes(profile: &str, action: &str) -> Result<String, String> {

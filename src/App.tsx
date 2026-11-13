@@ -40,6 +40,8 @@ const REPO_URL = "https://github.com/dm0xa/colima-desk";
 const SUPPORT_URL = "https://buymeacoffee.com/dm0xa";
 /** How long a storage report is reused before the page re-reads it in the background. */
 const CLEANUP_TTL = 60_000;
+/** No daemon, or no answer yet: every storage widget renders the same empty state. */
+const EMPTY_DISK: DiskUsage = { images: 0, containers: 0, volumes: 0, build_cache: 0, reclaimable: 0 };
 /** Persisted dashboard layouts from before the current composition are discarded once. */
 const LAYOUT_STALE = (() => {
   try { return Number(localStorage.getItem(LAYOUT_VERSION_KEY) ?? "0") < LAYOUT_VERSION; } catch { return true; }
@@ -279,6 +281,8 @@ function App() {
   const containersRef = useRef<Container[]>([]);
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  /** Bumped per refresh; a late answer from an older one is dropped. */
+  const refreshGen = useRef(0);
   const [lastUpdated, setLastUpdated] = useState(0);
   const [search, setSearch] = useState("");
   const [containerFilter, setContainerFilter] = useState<ContainerScope>("all");
@@ -790,10 +794,42 @@ function App() {
   async function safe<T>(p: Promise<T>, fallback: T): Promise<T> {
     try { return await p; } catch (e) { reportProblem(e); return fallback; }
   }
-  async function refresh(profile: string = selected) {
+  /** Points the container client at a profile before any docker command runs. The runtime
+   *  comes from a profile list already in hand, so this never waits on `colima status`. */
+  async function activateProfile(name: string, list: Profile[] = profiles) {
+    const runtime = list.find((p) => p.name === name)?.runtime ?? null;
+    return safe(invoke<string>("set_profile_cmd", { profile: name, runtime }), "");
+  }
+  /** The container lists this profile's daemon answers, read as one wave. */
+  async function readDocker() {
+    const [c, i, vol, net, cmp] = await Promise.all([
+      safe(invoke<Container[]>("list_containers_cmd"), []),
+      safe(invoke<Image[]>("list_images_cmd"), []),
+      safe(invoke<Volume[]>("list_volumes_cmd"), []),
+      safe(invoke<Network[]>("list_networks_cmd"), []),
+      safe(invoke<ComposeProject[]>("compose_list_cmd"), []),
+    ]);
+    return { c, i, vol, net, cmp };
+  }
+  /** `docker system df` scans every layer and takes longer than the whole list wave, so it
+   *  lands after the containers are on screen. A refresh replaced by a newer one (or by a
+   *  profile switch) drops its answer instead of overwriting fresher state. */
+  async function readDisk(gen: number) {
+    const dsk = await safe(invoke<DiskUsage>("disk_usage_cmd"), EMPTY_DISK);
+    if (gen === refreshGen.current) setDisk(dsk);
+  }
+  /**
+   * One data refresh. `preloaded` is a profile list the caller has just read: a launch then
+   * pays for `colima list` once, and — because the profile's state is already known — the
+   * container commands run in the same wave as the tool probes instead of behind them.
+   */
+  async function refresh(profile: string = selected, preloaded?: Profile[]) {
+    const gen = ++refreshGen.current;
     setRefreshing(true);
+    const knownUp = preloaded?.find((p) => p.name === profile)?.status.toLowerCase() === "running";
+    const docker = knownUp ? readDocker() : null;
     const [p, srv, kind, lima, sys] = await Promise.all([
-      safe(invoke<Profile[]>("list_profiles_cmd"), []),
+      preloaded ? Promise.resolve(preloaded) : safe(invoke<Profile[]>("list_profiles_cmd"), []),
       safe(invoke<[string, number][]>("model_serve_status_cmd"), []),
       safe(invoke<string[]>("kind_clusters_cmd"), []),
       safe(invoke<LimaVm[]>("lima_vms_cmd"), []),
@@ -806,17 +842,10 @@ function App() {
     if (!p.find((x) => x.name === profile) && p.length) setSelected(p[0].name);
     // Docker data only exists while the profile's daemon is up; a stopped profile
     // shows empty views instead of a "cannot connect" error.
-    const profileUp = p.find((x) => x.name === profile)?.status.toLowerCase() === "running";
+    const profileUp = docker !== null || p.find((x) => x.name === profile)?.status.toLowerCase() === "running";
     if (profileUp) {
-      const [c, i, vol, net, dsk, cmp] = await Promise.all([
-        safe(invoke<Container[]>("list_containers_cmd"), []),
-        safe(invoke<Image[]>("list_images_cmd"), []),
-        safe(invoke<Volume[]>("list_volumes_cmd"), []),
-        safe(invoke<Network[]>("list_networks_cmd"), []),
-        safe(invoke<DiskUsage>("disk_usage_cmd"), { images: 0, containers: 0, volumes: 0, build_cache: 0, reclaimable: 0 }),
-        safe(invoke<ComposeProject[]>("compose_list_cmd"), []),
-      ]);
-      setContainers(c); setImages(i); setVolumes(vol); setNetworks(net); setDisk(dsk); setCompose(cmp);
+      const { c, i, vol, net, cmp } = docker ? await docker : await readDocker();
+      setContainers(c); setImages(i); setVolumes(vol); setNetworks(net); setCompose(cmp);
       // Counts come from the lists already in hand; a second set of docker list
       // calls for the same numbers was the most expensive part of a refresh.
       setCounts({
@@ -825,10 +854,11 @@ function App() {
         images: i.length,
         volumes: vol.length,
       });
+      void readDisk(gen);
     } else {
       setContainers([]); setImages([]); setVolumes([]); setNetworks([]); setCompose([]);
       setCounts({ containers: 0, running: 0, images: 0, volumes: 0 });
-      setDisk({ images: 0, containers: 0, volumes: 0, build_cache: 0, reclaimable: 0 });
+      setDisk(EMPTY_DISK);
     }
     setLastUpdated(Date.now());
     setRefreshing(false);
@@ -900,7 +930,7 @@ function App() {
     setSelected(name);
     setNetworkScope(null);
     setDiag(null);
-    await safe(invoke<string>("set_profile_cmd", { profile: name }), "");
+    await activateProfile(name);
     await refresh(name);
   }
   useEffect(() => {
@@ -911,9 +941,10 @@ function App() {
       const name = list.find((p) => p.name === selected)?.name ?? list[0]?.name ?? "";
       if (name) {
         setSelected(name);
-        await safe(invoke<string>("set_profile_cmd", { profile: name }), "");
+        await activateProfile(name, list);
       }
-      await refresh();
+      // The list above is the one refresh needs, so it is not read twice.
+      await refresh(name, list);
       void checkAppRelease();
     })();
   }, []);
@@ -989,7 +1020,6 @@ function App() {
     document.addEventListener("visibilitychange", run);
     return () => { clearInterval(id); document.removeEventListener("visibilitychange", run); };
   }, []);
-  useEffect(() => { if (showOnboarding) void refresh(); }, [showOnboarding]);
   function finishOnboarding() {
     try { localStorage.setItem("colimaDesk.onboarded", "1"); } catch { /* private mode */ }
     setShowOnboarding(false);

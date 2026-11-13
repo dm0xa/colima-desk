@@ -9,6 +9,9 @@ static ENDPOINT: RwLock<Option<String>> = RwLock::new(None);
 /// Container client for the selected profile. Colima's own `nerdctl` path is preferred
 /// for containerd profiles; docker-runtime profiles only have the Docker CLI.
 static CLIENT: RwLock<Client> = RwLock::new(Client::Docker);
+/// Profile the two above describe. A late answer about another profile must not rewrite
+/// them, because the user may have switched while that command was in flight.
+static ACTIVE_PROFILE: RwLock<String> = RwLock::new(String::new());
 
 #[derive(Clone)]
 enum Client {
@@ -33,6 +36,31 @@ pub fn set_client(runtime: &str, profile: &str) {
     };
     if let Ok(mut slot) = CLIENT.write() {
         *slot = next;
+    }
+    if let Ok(mut slot) = ACTIVE_PROFILE.write() {
+        *slot = profile.to_string();
+    }
+}
+
+/// Whether a reported socket should replace the current endpoint. Pure so the rule can be
+/// tested without touching the process-wide endpoint the other tests read.
+fn adopted_socket<'a>(active: &str, profile: &str, socket: &'a str, current: Option<&str>) -> Option<&'a str> {
+    let socket = socket.trim();
+    if socket.is_empty() || active != profile || current == Some(socket) {
+        return None;
+    }
+    Some(socket)
+}
+
+/// A `colima status` answer that arrived after the switch it was started for. The socket
+/// is colima's own convention in every normal install, so this only ever replaces the
+/// guessed path with the reported one — and only while that profile is still the active
+/// one, so a switch that landed first is never undone.
+pub fn confirm_endpoint(profile: &str, socket: &str) {
+    let active = ACTIVE_PROFILE.read().map(|p| p.clone()).unwrap_or_default();
+    let current = ENDPOINT.read().ok().and_then(|slot| slot.clone());
+    if let Some(socket) = adopted_socket(&active, profile, socket, current.as_deref()) {
+        set_endpoint(Some(socket.to_string()));
     }
 }
 
@@ -772,8 +800,20 @@ pub fn network_map() -> Result<Vec<NetworkMapEntry>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{disk_usage, human_bytes, percent, set_endpoint, DiskUsage, DISK_CACHE};
+    use super::{adopted_socket, disk_usage, human_bytes, percent, set_endpoint, DiskUsage, DISK_CACHE};
     use std::time::Instant;
+
+    /// The launch sets the socket from colima's convention and asks `colima status` to
+    /// confirm it behind the caller. That late answer belongs to the profile it was started
+    /// for: a switch that landed first must not be undone by it, and an empty socket (a
+    /// stopped profile) must not replace a working one.
+    #[test]
+    fn late_status_only_confirms_the_active_profile() {
+        assert_eq!(adopted_socket("alpha", "beta", "unix:///beta.sock", Some("unix:///alpha.sock")), None);
+        assert_eq!(adopted_socket("alpha", "alpha", "unix:///elsewhere.sock", Some("unix:///alpha.sock")), Some("unix:///elsewhere.sock"));
+        assert_eq!(adopted_socket("alpha", "alpha", "unix:///alpha.sock", Some("unix:///alpha.sock")), None);
+        assert_eq!(adopted_socket("alpha", "alpha", "  ", Some("unix:///alpha.sock")), None);
+    }
 
     /// The `docker system df` reading must be served from cache: a refresh that paid
     /// 1.3 s for it every 15 s was the slowest part of the app.

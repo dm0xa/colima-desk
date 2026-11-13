@@ -55,7 +55,17 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> R<T> + Send + 'static) 
 async fn list_profiles_cmd() -> R<Vec<Profile>> { blocking(colima::list_profiles).await }
 
 #[tauri::command]
-async fn status_cmd(profile: String) -> R<Status> { blocking(move || colima::status(&profile)).await }
+async fn status_cmd(profile: String) -> R<Status> {
+    let target = profile.clone();
+    let status = blocking(move || colima::status(&target)).await?;
+    // The socket this reports is the confirmation the launch deferred: adopt it while this
+    // profile is still the active one, so the endpoint set from the path convention is
+    // replaced by the reported one as soon as it is known.
+    if let Some(socket) = status.docker_socket.as_deref() {
+        docker::confirm_endpoint(&profile, socket);
+    }
+    Ok(status)
+}
 
 #[tauri::command]
 async fn start_cmd(opts: StartOpts) -> R<String> { blocking(move || colima::start(&opts)).await }
@@ -235,22 +245,18 @@ async fn system_status_cmd() -> tools::SystemStatus {
 }
 
 /// Points every subsequent docker command at this profile's daemon.
+///
+/// The endpoint is colima's own convention (`<colima home>/<profile>/docker.sock`), which
+/// is the path `colima status` reports, so a launch does not sit on that ~1 s command
+/// before the first container list. `runtime` comes from the profile list the caller has
+/// already read. A status run behind the caller only confirms the socket.
 #[tauri::command]
-async fn set_profile_cmd(profile: String) -> R<String> {
-    let target = profile.clone();
-    let (endpoint, runtime) = blocking(move || {
-        // `colima status` is the slowest call in the app (~700 ms); one run answers
-        // both the socket path and the runtime.
-        let status = colima::status(&target).ok();
-        let endpoint = colima::docker_endpoint(&target, status.as_ref());
-        let runtime = status.and_then(|s| s.runtime).unwrap_or_default();
-        Ok::<(String, String), String>((endpoint, runtime))
-    })
-    .await?;
+fn set_profile_cmd(profile: String, runtime: Option<String>) -> String {
+    let endpoint = colima::docker_endpoint(&profile, None);
     docker::set_endpoint(Some(endpoint.clone()));
     // Colima's own nerdctl path is the primary client for containerd profiles.
-    docker::set_client(&runtime, &profile);
-    Ok(endpoint)
+    docker::set_client(runtime.as_deref().unwrap_or("docker"), &profile);
+    endpoint
 }
 
 #[tauri::command]
@@ -437,6 +443,8 @@ pub fn run() {
         .manage(StatsStream(Mutex::new(None)))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // Warm the first read the window makes, while it is still loading the bundle.
+            std::thread::spawn(colima::prefetch_profiles);
             // macOS keeps a window created larger than the display at that size, so on
             // smaller screens the configured geometry hangs off the right/bottom edge.
             if let Some(win) = app.get_webview_window("main") {
